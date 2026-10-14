@@ -4,9 +4,12 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT
  *
  * Copyright 2026 Simon Ratcliffe
+ *
+ * Changes: pass the requested effect configuration from the command line
+ * through the controller to the video-processing model.
  */
 package comp3011;
 
@@ -45,6 +48,7 @@ public class VideoPlayerApp extends Application {
 
         controller = new VideoPlayerController(
                 commandLineController.isAudioRequested(),
+                commandLineController.getEffects(),
                 this::setVideoSize);
 
         Scene scene = new Scene(controller.getView().getRoot());
