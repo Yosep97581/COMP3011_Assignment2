@@ -10,6 +10,7 @@
  *
  * Changes: create the ordered list of visual processors from the supplied
  * effect configuration rather than from hard-coded commented-out lines.
+ * Assign stable indexes for repeated effects (used by parallel workers later).
  */
 package comp3011;
 
@@ -107,9 +108,7 @@ public class VideoPlayerModel {
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
         // Each command-line occurrence creates a separate effect instance.
         // Keeping the order is important because effects modify the same frame.
-        this.frameProcessors = effects.stream()
-                .map(FrameEffect::createProcessor)
-                .toList();
+        this.frameProcessors = FrameEffect.createProcessors(effects);
     }
 
     public void play(File file) {

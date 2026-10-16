@@ -4,9 +4,12 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT
  *
  * Copyright 2026 Simon Ratcliffe
+ *
+ * Changes: allow effect instance indexes to be assigned explicitly, so
+ * processing workers reproduce the same visual patterns.
  */
 package comp3011;
 
@@ -31,6 +34,15 @@ import org.bytedeco.javacv.Frame;
  */
 public abstract class FrameProcessor {
     protected InfoVideo videoInfo;
+    // Assigned by the effect list before initialise(); stable across workers and replays.
+    protected int instanceIndex;
+
+    void setInstanceIndex(int index) {
+        if (index < 0) {
+            throw new IllegalArgumentException("Effect instance index cannot be negative");
+        }
+        this.instanceIndex = index;
+    }
 
     public FrameProcessor() {
     }

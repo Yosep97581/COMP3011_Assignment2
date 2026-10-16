@@ -4,9 +4,12 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT
  *
  * Copyright 2026 Simon Ratcliffe
+ *
+ * Changes: use the effect instance index assigned by FrameProcessor instead
+ * of a shared static counter (needed for repeatable parallel processing).
  */
 package comp3011;
 
@@ -28,15 +31,7 @@ import org.bytedeco.javacv.Frame;
 public class FrameFlickerer extends FrameProcessor {
     private static final double FLICKER_PERCENTAGE_SD = 5.0;
 
-    private static int nextInstanceIndex;
-
-    private final int instanceIndex;
     private int mediaSeed;
-
-    public FrameFlickerer() {
-        super();
-        instanceIndex = nextInstanceIndex++;
-    }
 
     @Override
     public void initialise(InfoVideo videoInfo) throws Exception {

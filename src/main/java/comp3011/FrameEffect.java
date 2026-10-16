@@ -6,6 +6,9 @@
  */
 package comp3011;
 
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
 import java.util.function.Supplier;
 
 /**
@@ -42,6 +45,24 @@ public enum FrameEffect {
 
     public FrameProcessor createProcessor() {
         return factory.get();
+    }
+
+
+    /**
+     * Build a new ordered chain for one playback thread or processing worker.
+     * The index counts occurrences of each effect type, not the number of threads.
+     */
+    public static List<FrameProcessor> createProcessors(List<FrameEffect> effects) {
+        EnumMap<FrameEffect, Integer> counts = new EnumMap<>(FrameEffect.class);
+        List<FrameProcessor> processors = new ArrayList<>();
+        for (FrameEffect effect : effects) {
+            int index = counts.getOrDefault(effect, 0);
+            FrameProcessor processor = effect.createProcessor();
+            processor.setInstanceIndex(index);
+            counts.put(effect, index + 1);
+            processors.add(processor);
+        }
+        return processors;
     }
 
     public static FrameEffect fromShortOption(char option) {

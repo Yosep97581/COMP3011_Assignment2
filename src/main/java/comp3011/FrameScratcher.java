@@ -4,9 +4,12 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT
  *
  * Copyright 2026 Simon Ratcliffe
+ *
+ * Changes: use the effect instance index assigned by FrameProcessor instead
+ * of a shared static counter (needed for repeatable parallel processing).
  */
 package comp3011;
 
@@ -33,16 +36,8 @@ public class FrameScratcher extends FrameProcessor {
     private static final double THICK_SCRATCH_PROBABILITY = 0.15;
     private static final int SCRATCH_MAX_TRAVEL = 32;
 
-    private static int nextInstanceIndex;
-
-    private final int instanceIndex;
     private final List<Scratch> scratches = new ArrayList<>();
     private int mediaSeed;
-
-    public FrameScratcher() {
-        super();
-        instanceIndex = nextInstanceIndex++;
-    }
 
     @Override
     public void initialise(InfoVideo videoInfo) throws Exception {

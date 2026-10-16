@@ -4,9 +4,12 @@
  * 
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT
  *
  * Copyright 2026 Simon Ratcliffe
+ *
+ * Changes: use the effect instance index assigned by FrameProcessor instead
+ * of a shared static counter (needed for repeatable parallel processing).
  */
 package comp3011;
 
@@ -54,9 +57,6 @@ public class FrameMottler extends FrameProcessor {
     private static final int MEDIUM_FIELD_SALT = 0x4d454449;
     private static final int LARGE_FIELD_SALT = 0x4c415247;
 
-    private static int nextInstanceIndex;
-
-    private final int instanceIndex;
     private int mediaSeed;
     private int cachedDamageMaskSegment = Integer.MIN_VALUE;
     private double[] damageMaskA;
@@ -71,11 +71,6 @@ public class FrameMottler extends FrameProcessor {
     private int blockBlueScaleIndex;
     private int blockGreenScaleIndex;
     private int blockRedScaleIndex;
-
-    public FrameMottler() {
-        super();
-        instanceIndex = nextInstanceIndex++;
-    }
 
     @Override
     public void initialise(InfoVideo videoInfo) throws Exception {
