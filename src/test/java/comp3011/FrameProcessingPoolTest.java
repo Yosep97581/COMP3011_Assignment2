@@ -1,6 +1,6 @@
 /*
  * Tests by Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT.
- * Check worker independence, bounded frame ownership, effect order and failures.
+ * Check worker independence, frame ownership, ordering, backpressure and shutdown.
  */
 package comp3011;
 
@@ -129,7 +129,7 @@ class FrameProcessingPoolTest {
                     }
                 }), 1, 1);
                 Frame input = frame(1)) {
-            assertTrue(pool.trySubmit(1, input, new InfoFrame(2, 0)));
+            assertTrue(pool.trySubmit(0, input, new InfoFrame(2, 0)));
             FrameProcessingPool.Result result = waitForResult(pool);
             try {
                 assertFalse(result.succeeded());
@@ -199,4 +199,119 @@ class FrameProcessingPoolTest {
             assertFalse(pool.trySubmit(0, input, new InfoFrame(0, 0)));
         }
     }
+
+    @Test
+    void returnsFramesInOrderEvenWhenSecondWorkerFinishesFirst() throws Exception {
+        CountDownLatch firstWorkerStarted = new CountDownLatch(1);
+        CountDownLatch releaseFirstWorker = new CountDownLatch(1);
+        CountDownLatch secondWorkerFinished = new CountDownLatch(1);
+        try (FrameProcessingPool pool = new FrameProcessingPool(info, () -> List.of(
+                new FrameProcessor() {
+                    @Override
+                    public void process(Frame frame, InfoFrame metadata) throws Exception {
+                        if (metadata.frameNumber() == 0) {
+                            firstWorkerStarted.countDown();
+                            if (!releaseFirstWorker.await(2, TimeUnit.SECONDS)) {
+                                throw new Exception("First frame was never released");
+                            }
+                        } else if (metadata.frameNumber() == 1) {
+                            secondWorkerFinished.countDown();
+                        }
+                    }
+                }), 2, 2);
+                Frame first = frame(10);
+                Frame second = frame(20);
+                Frame third = frame(30)) {
+            try {
+                assertTrue(pool.trySubmit(0, first, new InfoFrame(0, 0)));
+                assertTrue(firstWorkerStarted.await(2, TimeUnit.SECONDS));
+                assertTrue(pool.trySubmit(1, second, new InfoFrame(1, 41667)));
+                assertTrue(secondWorkerFinished.await(2, TimeUnit.SECONDS));
+
+                // Frame 1 may be finished, but cannot be delivered before frame 0.
+                assertNull(pool.pollResult());
+                assertFalse(pool.trySubmit(2, third, new InfoFrame(2, 83334)),
+                        "Waiting results must still count towards the memory limit");
+
+                releaseFirstWorker.countDown();
+                FrameProcessingPool.Result result0 = waitForResult(pool);
+                try {
+                    assertEquals(0L, result0.sequence());
+                    assertTrue(result0.succeeded());
+                } finally {
+                    result0.frame().close();
+                }
+
+                // Collecting frame 0 frees space for the next submitted frame.
+                assertTrue(pool.trySubmit(2, third, new InfoFrame(2, 83334)));
+                FrameProcessingPool.Result result1 = waitForResult(pool);
+                FrameProcessingPool.Result result2 = waitForResult(pool);
+                try {
+                    assertEquals(1L, result1.sequence());
+                    assertEquals(2L, result2.sequence());
+                } finally {
+                    result1.frame().close();
+                    result2.frame().close();
+                }
+            } finally {
+                releaseFirstWorker.countDown();
+            }
+        }
+    }
+
+    @Test
+    void requiresConsecutiveSequenceNumbersAndAllowsRetryAfterBackpressure() throws Exception {
+        try (FrameProcessingPool pool = new FrameProcessingPool(info, List.of(), 1, 1);
+                Frame first = frame(1);
+                Frame next = frame(2)) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> pool.trySubmit(-1, first, new InfoFrame(0, 0)));
+            assertThrows(IllegalArgumentException.class,
+                    () -> pool.trySubmit(2, first, new InfoFrame(0, 0)));
+            assertTrue(pool.trySubmit(0, first, new InfoFrame(0, 0)));
+            assertThrows(IllegalArgumentException.class,
+                    () -> pool.trySubmit(0, first, new InfoFrame(0, 0)));
+            assertFalse(pool.trySubmit(1, next, new InfoFrame(1, 41667)));
+
+            FrameProcessingPool.Result result = waitForResult(pool);
+            try {
+                assertEquals(0L, result.sequence());
+            } finally {
+                result.frame().close();
+            }
+            assertTrue(pool.trySubmit(1, next, new InfoFrame(1, 41667)));
+            result = waitForResult(pool);
+            try {
+                assertEquals(1L, result.sequence());
+            } finally {
+                result.frame().close();
+            }
+        }
+    }
+
+    @Test
+    void closingPoolRejectsWorkAndNeverDeliversOldFrames() throws Exception {
+        CountDownLatch enteredWorker = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        FrameProcessingPool pool = new FrameProcessingPool(info, () -> List.of(
+                new FrameProcessor() {
+                    @Override
+                    public void process(Frame frame, InfoFrame metadata) throws Exception {
+                        enteredWorker.countDown();
+                        releaseWorker.await(2, TimeUnit.SECONDS);
+                    }
+                }), 1, 1);
+        try (Frame first = frame(1); Frame next = frame(2)) {
+            assertTrue(pool.trySubmit(0, first, new InfoFrame(0, 0)));
+            assertTrue(enteredWorker.await(2, TimeUnit.SECONDS));
+            pool.close();
+            pool.close(); // Shutdown should be safe to call more than once.
+            assertFalse(pool.trySubmit(1, next, new InfoFrame(1, 41667)));
+            assertNull(pool.pollResult());
+        } finally {
+            releaseWorker.countDown();
+            pool.close();
+        }
+    }
+
 }

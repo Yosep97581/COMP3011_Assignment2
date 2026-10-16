@@ -3,14 +3,16 @@
  * New class by Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT.
  *
  * Changes: process independent video frames on a bounded pool of background threads.
+ * Deliver frames in sequence and keep the memory limit effective even when
+ * workers finish out of order.
  */
 package comp3011;
 
 import java.util.List;
 import java.util.Objects;
-import java.util.Queue;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
@@ -38,7 +40,12 @@ public final class FrameProcessingPool implements AutoCloseable {
     private final ThreadPoolExecutor executor;
     private final ThreadLocal<List<FrameProcessor>> workerProcessors;
     private final Semaphore inFlight;
-    private final Queue<Result> completed = new ConcurrentLinkedQueue<>();
+    // Results stay here until all earlier frames have been returned. Keeping
+    // them inside the pool means completed-but-waiting frames still count
+    // towards the in-flight memory limit.
+    private final NavigableMap<Long, Result> completed = new TreeMap<>();
+    private long nextSequenceToSubmit;
+    private long nextSequenceToDeliver;
     private volatile boolean closed;
 
     public FrameProcessingPool(InfoVideo videoInfo, List<FrameEffect> effects,
@@ -81,13 +88,21 @@ public final class FrameProcessingPool implements AutoCloseable {
     }
 
     /**
-     * Try to submit a frame without waiting for space. Return false when the
-     * pool is full or stopped; the decoder should retry later, not lose a frame.
+     * Submit frames with consecutive sequence numbers starting at zero.
+     * Return false if full so the decoder can retry the SAME frame later.
+     * Start a fresh pool and numbering sequence after a seek/restart.
      */
     public synchronized boolean trySubmit(long sequence, Frame source, InfoFrame info) {
         Objects.requireNonNull(source);
         Objects.requireNonNull(info);
-        if (closed || !inFlight.tryAcquire()) {
+        if (closed) {
+            return false;
+        }
+        if (sequence != nextSequenceToSubmit) {
+            throw new IllegalArgumentException("Expected frame sequence "
+                    + nextSequenceToSubmit + " but got " + sequence);
+        }
+        if (!inFlight.tryAcquire()) {
             return false;
         }
 
@@ -95,6 +110,7 @@ public final class FrameProcessingPool implements AutoCloseable {
         try {
             copy = source.clone(); // Deep copy, not another view of the FFmpeg buffer.
             executor.execute(new ProcessingTask(sequence, copy, info));
+            nextSequenceToSubmit++;
             return true;
         } catch (RejectedExecutionException e) {
             if (copy != null) {
@@ -112,13 +128,19 @@ public final class FrameProcessingPool implements AutoCloseable {
     }
 
     /**
-     * Non-blocking result retrieval. Results can arrive out of order; the
-     * playback model must arrange them by sequence before displaying them.
-     * The receiver must close the returned frame when finished with it.
+     * Return only the next frame in decoding order, without blocking the GUI.
+     * A later completed frame waits here until earlier frames finish.
+     * The caller must close every returned frame after converting/using it.
      */
-    public Result pollResult() {
-        Result result = completed.poll();
+    public synchronized Result pollResult() {
+        if (closed) {
+            return null;
+        }
+        Result result = completed.remove(nextSequenceToDeliver);
         if (result != null) {
+            nextSequenceToDeliver++;
+            // Do not free the permit while a completed frame is still waiting
+            // for an earlier frame. Otherwise buffering could grow unchecked.
             inFlight.release();
         }
         return result;
@@ -137,10 +159,10 @@ public final class FrameProcessingPool implements AutoCloseable {
                 task.frame.close();
             }
         }
-        Result result;
-        while ((result = completed.poll()) != null) {
+        for (Result result : completed.values()) {
             result.frame().close();
         }
+        completed.clear();
     }
 
     private final class ProcessingTask implements Runnable {
@@ -176,7 +198,7 @@ public final class FrameProcessingPool implements AutoCloseable {
                 if (closed) {
                     frame.close();
                 } else {
-                    completed.add(new Result(sequence, frame, info, failure));
+                    completed.put(sequence, new Result(sequence, frame, info, failure));
                 }
             }
         }
