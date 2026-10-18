@@ -11,6 +11,8 @@
  * Changes: create the ordered list of visual processors from the supplied
  * effect configuration rather than from hard-coded commented-out lines.
  * Assign stable indexes for repeated effects (used by parallel workers later).
+ * Route video frames through the concurrent worker pool while keeping playback
+ * controls, audio scheduling and decoder ownership on the JavaFX thread for now.
  */
 package comp3011;
 
@@ -34,9 +36,9 @@ import javafx.scene.image.Image;
  * The model part of the video player model-view-controller architecture.
  *
  * <p>
- * Owns the FFmpeg decoder, playback clock, seeking logic, audio scheduling,
- * and frame processing - which it all manages through cooperative multi-tasking
- * on a single thread. It publishes decoded frames and playback state through
+ * Owns the FFmpeg decoder, playback clock, seeking logic and audio scheduling.
+ * Video effects can run on background workers while the JavaFX thread collects
+ * the finished frames in their original order. It publishes playback state through
  * callbacks supplied by its owning {@link VideoPlayerController}, keeping it
  * decoupled from the JavaFX view.
  * </p>
@@ -45,6 +47,15 @@ public class VideoPlayerModel {
     private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
     private static final long FIVE_SECONDS_US = 5_000_000L;
     private static final long AUDIO_LEAD_NS = 30_000_000L;
+    // Keep a few frames in flight without letting HD frame copies use unlimited memory.
+    private static final int EFFECT_WORKERS = Math.max(1,
+            Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
+    private static final int MAX_IN_FLIGHT = Math.max(2, EFFECT_WORKERS * 2);
+    private static final int DECODE_STEPS_PER_PULSE = 4;
+
+    // Optional baseline for comparing the original design with the concurrent path.
+    private final boolean singleThreaded = Boolean.getBoolean("video.singleThreaded");
+    private final List<FrameEffect> selectedEffects;
 
     private final List<FrameProcessor> frameProcessors;
     private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
@@ -77,9 +88,18 @@ public class VideoPlayerModel {
     private boolean prepareNextFrameQueued; // True only when the event loop needs to call our prepareNextFrame method.
     private boolean playbackOpen; // True when playback is happening.
     private boolean pauseRequested;
+    private boolean pausedPreviewPending; // Show a single preview after a paused seek.
     private boolean audioOutputEnabled;
     private boolean audioAvailable;
     private boolean frameProcessorsInitialised;
+    private FrameProcessingPool processingPool;
+    // When the pool is full, this frame must be submitted before grabbing again:
+    // FFmpeg can reuse its buffers on the next grab.
+    private Frame waitingForSubmission;
+    private InfoFrame waitingFrameInfo;
+    private long submittedFrames;
+    private long collectedFrames;
+    private boolean reachedVideoEnd;
     private long currentTimestampUs;
     private long videoDurationUs = NO_SEEK_REQUEST;
     private int videoFrameDurationUs;
@@ -108,7 +128,8 @@ public class VideoPlayerModel {
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
         // Each command-line occurrence creates a separate effect instance.
         // Keeping the order is important because effects modify the same frame.
-        this.frameProcessors = FrameEffect.createProcessors(effects);
+        this.selectedEffects = List.copyOf(effects);
+        this.frameProcessors = FrameEffect.createProcessors(selectedEffects);
     }
 
     public void play(File file) {
@@ -143,6 +164,7 @@ public class VideoPlayerModel {
         }
 
         pauseRequested = !pauseRequested;
+        pausedPreviewPending = false;
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
         if (pauseRequested) {
@@ -200,6 +222,9 @@ public class VideoPlayerModel {
         }
 
         try {
+            pausedPreviewPending = pauseRequested;
+            // Stop the old workers before a seek; their results belong to
+            // the previous playback position and must never be displayed.
             grabber.setTimestamp(grabTimestampUs);
             resetPlaybackClock(logicalTimestampUs);
             flushAudioOutput();
@@ -214,6 +239,7 @@ public class VideoPlayerModel {
         closePlaybackResources();
 
         pauseRequested = initiallyPaused;
+        pausedPreviewPending = initiallyPaused;
         currentTimestampUs = initialRelativeSeekBaseUs != NO_SEEK_REQUEST
                 ? initialRelativeSeekBaseUs
                 : startTimestampUs;
@@ -268,6 +294,7 @@ public class VideoPlayerModel {
     private void resetPlaybackClock(long logicalTimestampUs) {
         pendingAudio.clear();
         preparedFrame = null;
+        resetProcessingPipeline();
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
         firstTimestampUs = NO_SEEK_REQUEST;
@@ -278,21 +305,142 @@ public class VideoPlayerModel {
 
     private void resumePlaybackClock(long now) {
         if (pauseStartedNs > 0 && playbackStartNs > 0) {
-            playbackStartNs += now - pauseStartedNs;
+            long pausedDuration = now - pauseStartedNs;
+            playbackStartNs += pausedDuration;
+            if (preparedFrame != null) {
+                PreparedFrame frame = preparedFrame;
+                preparedFrame = new PreparedFrame(frame.image(), frame.frameNumber(),
+                        frame.mediaTimestampUs(), frame.logicalTimestampUs(),
+                        frame.targetTimeNs() + pausedDuration, frame.preparedAtNs());
+            }
         }
         pauseStartedNs = 0;
     }
 
     private void prepareNextFrame() {
-        if (!playbackOpen || preparedFrame != null) {
+        if (!playbackOpen) {
             return;
         }
 
         try {
-            preparedFrame = readNextVideoFrame();
+            if (singleThreaded) {
+                if (preparedFrame == null) {
+                    preparedFrame = readNextVideoFrame();
+                }
+            } else {
+                submitOneVideoFrame();
+            }
         } catch (Exception e) {
             handlePlaybackError(e);
         }
+    }
+
+    /**
+     * Feed one video frame per call, so we don't monopolise JavaFX just to
+     * fill the pool. The decoder stays on this thread for this milestone.
+     * A later performance step can move decoding to its own thread.
+     */
+    private void submitOneVideoFrame() throws Exception {
+        if (reachedVideoEnd) {
+            return;
+        }
+        if (waitingForSubmission != null) {
+            submitWaitingFrame();
+            return;
+        }
+
+        // Audio-only packets may come between video packets. Limit the work
+        // per GUI pulse so a stretch of audio packets cannot freeze the GUI.
+        for (int i = 0; i < DECODE_STEPS_PER_PULSE; i++) {
+            Frame frame = grabFrame();
+            if (frame == null) {
+                reachedVideoEnd = true;
+                return;
+            }
+
+            long timestampUs = grabber.getTimestamp();
+            if (audioAvailable && frame.samples != null) {
+                queueAudio(timestampUs, frame);
+            }
+            if (frame.image == null) {
+                continue;
+            }
+
+            if (processingPool == null) {
+                InfoVideo videoInfo = new InfoVideo(
+                        mediaName(videoFile), totalVideoFrames,
+                        frame.imageWidth, frame.imageHeight, frame.imageDepth,
+                        frame.imageChannels, frame.imageStride, frameRate,
+                        intFrameRate, videoFrameDurationUs, grabber.getPixelFormat());
+                processingPool = new FrameProcessingPool(videoInfo, selectedEffects,
+                        EFFECT_WORKERS, MAX_IN_FLIGHT);
+            }
+
+            waitingForSubmission = frame;
+            waitingFrameInfo = new InfoFrame(grabber.getFrameNumber(), timestampUs);
+            submitWaitingFrame();
+            return;
+        }
+    }
+
+    private void submitWaitingFrame() {
+        if (processingPool.trySubmit(submittedFrames, waitingForSubmission, waitingFrameInfo)) {
+            submittedFrames++;
+            waitingForSubmission = null;
+            waitingFrameInfo = null;
+        }
+    }
+
+    /** Collect results only in decoding order, without waiting for a worker. */
+    private void collectProcessedFrame(long now) {
+        if (preparedFrame != null || processingPool == null) {
+            return;
+        }
+
+        FrameProcessingPool.Result result = processingPool.pollResult();
+        if (result == null) {
+            return;
+        }
+        collectedFrames++;
+        try (Frame frame = result.frame()) {
+            if (!result.succeeded()) {
+                handlePlaybackError(result.error());
+                return;
+            }
+
+            long timestampUs = result.info().timestampUs();
+            if (firstTimestampUs == NO_SEEK_REQUEST) {
+                // Start the clock when the first *processed* frame is ready.
+                // Otherwise the pipeline's initial buffering looks like late frames.
+                firstTimestampUs = timestampUs;
+                playbackStartNs = now;
+                if (pauseRequested) {
+                    pauseStartedNs = now;
+                }
+            }
+            long relativeUs = Math.max(0L, timestampUs - firstTimestampUs);
+            preparedFrame = new PreparedFrame(
+                    converter.convert(frame), result.info().frameNumber(),
+                    timestampUs, logicalPlaybackBaseUs + relativeUs,
+                    playbackStartNs + relativeUs * 1_000L, System.nanoTime());
+        } catch (Exception e) {
+            handlePlaybackError(e);
+        }
+    }
+
+    /** Cancel and discard all work from the previous playback/seek position. */
+    private void resetProcessingPipeline() {
+        if (processingPool != null) {
+            processingPool.close();
+            processingPool = null;
+        }
+        waitingForSubmission = null;
+        waitingFrameInfo = null;
+        submittedFrames = 0;
+        collectedFrames = 0;
+        reachedVideoEnd = false;
+        frameProcessorsInitialised = false;
+        prepareNextFrameQueued = false;
     }
 
     private PreparedFrame readNextVideoFrame() throws Exception {
@@ -367,6 +515,10 @@ public class VideoPlayerModel {
         if (!playbackOpen) {
             return;
         }
+        if (!singleThreaded) {
+            pumpConcurrentPlayback(now);
+            return;
+        }
 
         // Task (1)
         writeDueAudio(now);
@@ -391,6 +543,34 @@ public class VideoPlayerModel {
                     prepareNextFrame();
                 }
             });
+        }
+    }
+
+    /**
+     * The GUI only polls finished frames; it never waits for a processing worker.
+     * Decoding is still cooperative in this stage and is tackled separately.
+     */
+    private void pumpConcurrentPlayback(long now) {
+        writeDueAudio(now);
+        collectProcessedFrame(now);
+        if (!playbackOpen) {
+            return; // A worker may have reported an error.
+        }
+        if (preparedFrame != null && preparedFrame.targetTimeNs() <= now
+                && (!pauseRequested || pausedPreviewPending)) {
+            displayPreparedFrame(now);
+            pausedPreviewPending = false;
+        }
+
+        if (!reachedVideoEnd && (!pauseRequested || submittedFrames == 0)) {
+            prepareNextFrame();
+        }
+
+        // At EOF, wait for the submitted frames and any queued audio to drain.
+        if (playbackOpen && reachedVideoEnd && waitingForSubmission == null
+                && submittedFrames == collectedFrames && preparedFrame == null
+                && pendingAudio.isEmpty()) {
+            finishPlayback();
         }
     }
 
@@ -485,6 +665,7 @@ public class VideoPlayerModel {
         playbackOpen = false;
         preparedFrame = null;
         pendingAudio.clear();
+        resetProcessingPipeline();
         firstTimestampUs = NO_SEEK_REQUEST;
         playbackStartNs = 0;
         pauseStartedNs = 0;
