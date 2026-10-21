@@ -192,6 +192,26 @@ class FrameProcessingPoolTest {
     }
 
     @Test
+    void capacityIncludesCompletedFramesUntilTheyAreCollected() throws Exception {
+        try (FrameProcessingPool pool = new FrameProcessingPool(info, List.of(), 1, 1);
+                Frame input = frame(9)) {
+            assertTrue(pool.hasCapacity());
+            assertTrue(pool.trySubmit(0, input, new InfoFrame(0, 0)));
+            assertFalse(pool.hasCapacity());
+            // Even after the worker finishes, the result occupies a slot.
+            Thread.sleep(25);
+            assertFalse(pool.hasCapacity());
+            FrameProcessingPool.Result result = waitForResult(pool);
+            try {
+                assertTrue(result.succeeded());
+                assertTrue(pool.hasCapacity());
+            } finally {
+                result.frame().close();
+            }
+        }
+    }
+
+    @Test
     void stoppedPoolRejectsAdditionalFrames() {
         FrameProcessingPool pool = new FrameProcessingPool(info, List.of(), 2, 2);
         pool.close();

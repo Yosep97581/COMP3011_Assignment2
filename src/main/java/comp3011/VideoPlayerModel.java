@@ -13,6 +13,8 @@
  * Assign stable indexes for repeated effects (used by parallel workers later).
  * Route video frames through the concurrent worker pool while keeping playback
  * controls, audio scheduling and decoder ownership on the JavaFX thread for now.
+ * Avoid decoding while the bounded processing pipeline is full, and print
+ * comparable timing summaries for the original and parallel modes.
  */
 package comp3011;
 
@@ -53,8 +55,9 @@ public class VideoPlayerModel {
     private static final int MAX_IN_FLIGHT = Math.max(2, EFFECT_WORKERS * 2);
     private static final int DECODE_STEPS_PER_PULSE = 4;
 
-    // Optional baseline for comparing the original design with the concurrent path.
-    private final boolean singleThreaded = Boolean.getBoolean("video.singleThreaded");
+    // Keep the original path for comparison, and skip worker overhead if no
+    // visual effects were selected at all.
+    private final boolean singleThreaded;
     private final List<FrameEffect> selectedEffects;
 
     private final List<FrameProcessor> frameProcessors;
@@ -100,6 +103,9 @@ public class VideoPlayerModel {
     private long submittedFrames;
     private long collectedFrames;
     private boolean reachedVideoEnd;
+    private long framesDisplayed;
+    private long latePreparedFrames;
+    private long totalFrameHeadroomUs;
     private long currentTimestampUs;
     private long videoDurationUs = NO_SEEK_REQUEST;
     private int videoFrameDurationUs;
@@ -129,6 +135,9 @@ public class VideoPlayerModel {
         // Each command-line occurrence creates a separate effect instance.
         // Keeping the order is important because effects modify the same frame.
         this.selectedEffects = List.copyOf(effects);
+        this.singleThreaded = Boolean.getBoolean("video.singleThreaded")
+                || Boolean.parseBoolean(System.getenv("VIDEO_SINGLE_THREADED"))
+                || selectedEffects.isEmpty();
         this.frameProcessors = FrameEffect.createProcessors(selectedEffects);
     }
 
@@ -298,6 +307,9 @@ public class VideoPlayerModel {
         currentTimestampUs = logicalTimestampUs;
         relativeSeekBaseUs = logicalTimestampUs;
         firstTimestampUs = NO_SEEK_REQUEST;
+        framesDisplayed = 0;
+        latePreparedFrames = 0;
+        totalFrameHeadroomUs = 0;
         logicalPlaybackBaseUs = logicalTimestampUs;
         playbackStartNs = 0;
         pauseStartedNs = pauseRequested ? System.nanoTime() : 0;
@@ -346,6 +358,12 @@ public class VideoPlayerModel {
         }
         if (waitingForSubmission != null) {
             submitWaitingFrame();
+            return;
+        }
+        // Check *before* calling FFmpeg. The original code decoded one more
+        // frame even when all worker slots were occupied. That wasted GUI time
+        // and made us hold a decoder buffer until space became available.
+        if (processingPool != null && !processingPool.hasCapacity()) {
             return;
         }
 
@@ -580,9 +598,15 @@ public class VideoPlayerModel {
         currentTimestampUs = frame.logicalTimestampUs();
         relativeSeekBaseUs = NO_SEEK_REQUEST;
 
-        // Dump some logging to the console once per second so that real time performance can be monitored.
+        long remainingUs = (frame.targetTimeNs() - frame.preparedAtNs()) / 1_000L;
+        framesDisplayed++;
+        totalFrameHeadroomUs += remainingUs;
+        if (remainingUs < 0) {
+            latePreparedFrames++;
+        }
+
+        // Keep the starter code's once-per-second trace for direct comparison.
         if (intFrameRate > 0 && frame.frameNumber() % intFrameRate == 0) {
-            long remainingUs = (frame.targetTimeNs() - frame.preparedAtNs()) / 1_000L;
             if (remainingUs < 0) {
                 System.out.printf("Frame headroom is \u001B[31m%5dus\u001B[0m out of %dus spare.%n",
                         remainingUs,
@@ -661,6 +685,17 @@ public class VideoPlayerModel {
     }
 
     private void closePlaybackResources() {
+        if (framesDisplayed > 0) {
+            double latePercent = 100.0 * latePreparedFrames / framesDisplayed;
+            long meanHeadroomUs = totalFrameHeadroomUs / framesDisplayed;
+            System.out.printf(
+                    "Playback performance [%s]: %d displayed, %d late-prepared (%.1f%%), average headroom %dus%n",
+                    singleThreaded ? "sequential" : "concurrent", framesDisplayed,
+                    latePreparedFrames, latePercent, meanHeadroomUs);
+            framesDisplayed = 0;
+            latePreparedFrames = 0;
+            totalFrameHeadroomUs = 0;
+        }
         playbackTimer.stop();
         playbackOpen = false;
         preparedFrame = null;

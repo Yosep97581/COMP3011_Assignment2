@@ -4,7 +4,8 @@
  *
  * Changes: process independent video frames on a bounded pool of background threads.
  * Deliver frames in sequence and keep the memory limit effective even when
- * workers finish out of order.
+ * workers finish out of order. Expose capacity so decoding can avoid reading
+ * ahead when the processing pipeline is full.
  */
 package comp3011;
 
@@ -85,6 +86,16 @@ public final class FrameProcessingPool implements AutoCloseable {
                 throw new IllegalStateException("Could not initialise frame effects", e);
             }
         });
+    }
+
+    /**
+     * The GUI can check this before decoding another frame. The count includes
+     * running tasks and completed frames that have not yet been displayed.
+     * Only the decoder/GUI thread submits frames, so this is advisory rather
+     * than a replacement for trySubmit's own backpressure check.
+     */
+    public synchronized boolean hasCapacity() {
+        return !closed && inFlight.availablePermits() > 0;
     }
 
     /**
