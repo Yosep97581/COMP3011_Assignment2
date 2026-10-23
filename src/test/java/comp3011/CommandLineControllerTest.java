@@ -8,6 +8,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -94,6 +97,25 @@ class CommandLineControllerTest {
                 "-12", file.getPath()
         });
         assertEquals("Only one display option can be used", cli.getErrorMessage());
+    }
+
+    @Test
+    void helpOverridesInvalidArgumentEvenWhenItComesLast() {
+        // TITAN checks that --help still works after a bad option.
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        PrintStream originalOut = System.out;
+        try (PrintStream captured = new PrintStream(output, true, StandardCharsets.UTF_8)) {
+            System.setOut(captured);
+            CommandLineController cli = new CommandLineController(new String[] {
+                    "--illegal-argument", "movie.mp4", "--help"
+            });
+            assertNull(cli.getErrorMessage());
+            assertEquals(0, cli.getExitCode());
+            assertFalse(cli.shouldLaunchApplication());
+        } finally {
+            System.setOut(originalOut);
+        }
+        assertTrue(output.toString(StandardCharsets.UTF_8).contains("Frame processors:"));
     }
 
     @Test

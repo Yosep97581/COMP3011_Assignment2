@@ -83,6 +83,20 @@ public class CommandLineController {
     }
 
     private void parse() {
+        // Help should work even when another argument before it is invalid.
+        // Check for it first so normal parsing cannot stop before reaching it.
+        boolean optionsEndedForHelp = false;
+        for (String arg : args) {
+            if ("--".equals(arg)) {
+                optionsEndedForHelp = true;
+            } else if (!optionsEndedForHelp && ("--help".equals(arg)
+                    || (arg.startsWith("-") && !arg.startsWith("--")
+                            && arg.substring(1).indexOf('h') >= 0))) {
+                helpRequested = true;
+                return;
+            }
+        }
+
         List<String> videoFiles = new ArrayList<>();
         boolean optionsEnded = false;
 
