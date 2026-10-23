@@ -51,4 +51,5 @@ They cover command-line parsing, worker-pool behaviour, frame ordering, and a se
 
 Based on the COMP3011 starter code by Simon Ratcliffe. Modifications and tests by Yosep Monier Nababan (a1939679), with assistance from OpenAI ChatGPT. Changes are also identified in relevant source-file headers. COMP3011 Assignment 2 - Java Local Project
 
-For more information on this code and how to get started, see https://learn.adelaide.edu.au/courses/30747/assignments/94505
+Repo link: https://github.com/Yosep97581/COMP3011_Assignment2
+
